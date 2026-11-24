@@ -13,11 +13,15 @@
 ## Install
 1. In TradingView open **Pine Editor**, paste the whole file, and click **Add to chart**.
 2. Use a 1–5 minute chart of a futures contract such as NQ1!, MNQ1!, ES1! or MES1!. The profiles are built from the chart's own bars, so you need at least 20 sessions of history loaded.
-3. Paste the day's option levels into **EOD option levels**, for example:
+3. Paste the day's option levels into **EOD option levels**, one line per ticker:
    ```
-   $NQ1!: Call Resistance, 21600, Put Support, 21000, HVL, 21300, 1D Min, 21080, 1D Max, 21550, Call Resistance 0DTE, 21450, Put Support 0DTE, 21150, HVL 0DTE, 21280, Gamma Wall 0DTE, 21400, GEX 1, 21500, GEX 2, 21350, GEX 3, 21200
+   NQ: GEX10=27750, Call Resistance=27600, GEX6=27500, 1D Max=27372.57, GEX5=27250, Put Support 0DTE=27010, Call Resistance 0DTE=27000, Gamma Wall 0DTE=27000, GEX3=26950, HVL=26850, GEX2=26750, HVL 0DTE=26740, GEX4=26600, GEX1=26500, 1D Min=26317.43, GEX9=26200, GEX7=26100, Put Support=26000, GEX8=25900
+   ES: Call Resistance=7550, GEX8=7450, ...
+   GC: HVL=3935, ...
+   SI: HVL=50, ...
+   CL: Call Resistance=90, ...
    ```
-   You can paste several tickers on separate lines. The indicator uses the line that matches the chart (MNQ uses the NQ line). `Name 21500` and `Name: 21500` also work.
+   You can paste the whole block into every chart. Each chart picks out its own line: MNQ uses NQ, MES uses ES, MGC uses GC, SIL uses SI and MCL uses CL. A chart with no matching line gets no levels.
 
 ## How a setup works
 - **Direction:** a lower-band confluence below price is a **long** setup. An upper-band confluence above price is a **short** setup.
@@ -35,7 +39,7 @@
 
 ## Risk overlay
 Set **Setup number** to the `#` shown on a label. The indicator then draws entry, stop, BE milestone and runners, and fills the risk box:
-- **Size** = floor(risk budget ÷ (stop distance × point value)). It uses Micro or Mini point values for NQ, ES, YM, RTY, GC and CL. Other symbols use the chart's own point value.
+- **Size** = floor(risk budget ÷ (stop distance × point value)). It uses Micro or Mini point values for NQ, ES, YM, RTY, GC, SI and CL. Other symbols use the chart's own point value.
 - **BE milestone** follows the model's BE rules. It is the nearest VWAP or VWAP band, or opposing option level, at least 0.5R away.
 - **Runners** are the next option, profile, VWAP and prior-day or prior-week high/low levels beyond BE, spaced at least 0.5R apart.
 

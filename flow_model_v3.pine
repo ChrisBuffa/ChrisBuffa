@@ -38,7 +38,7 @@ const string G_ADV  = "Model settings"
 const string TT_SETUP  = "Every T3 setup in the current session is numbered on its label (#1, #2, ...). Enter that number to load its entry, stop, position size, BE milestone and runner targets. 0 turns the risk overlay off."
 const string TT_CONTR  = "Micro = MNQ / MES / MYM / M2K / MGC / MCL point values. Mini = NQ / ES / YM / RTY / GC / CL. Works from the chart's root symbol, so NQ1! and MNQ1! both size correctly. Other symbols use the chart's own point value."
 const string TT_RUN    = "Runner targets are the next option levels, volume-profile levels, VWAP / VWAP bands and prior-day / prior-week highs and lows beyond the BE milestone, spaced at least 0.5R apart."
-const string TT_EOD    = "Paste end-of-day option levels as comma separated name, price pairs. A ticker prefix is optional, and several tickers can go on separate lines (the line that matches the chart is used). Example:\n$NQ1!: Call Resistance, 21600, Put Support, 21000, HVL, 21300, 1D Min, 21080, 1D Max, 21550, Call Resistance 0DTE, 21450, Put Support 0DTE, 21150, HVL 0DTE, 21280, Gamma Wall 0DTE, 21400, GEX 1, 21500, GEX 2, 21350, GEX 3, 21200\nNames not in the grading chart are drawn but never used as confluence."
+const string TT_EOD    = "Paste one line per ticker as TICKER: Name=price, Name=price, ... The line matching the chart is used (MNQ uses NQ, MES uses ES, MGC uses GC, SIL uses SI, MCL uses CL). Example:\nNQ: GEX10=27750, Call Resistance=27600, GEX6=27500, 1D Max=27372.57, Put Support 0DTE=27010, Gamma Wall 0DTE=27000, HVL=26850, GEX1=26500, 1D Min=26317.43, Put Support=26000\nES: Call Resistance=7550, GEX8=7450, HVL=7325, GEX1=7200, Put Support=7000\n'Name, price' pairs also work. Names not in the grading chart are drawn but never used as confluence."
 const string TT_INTRA  = "Use the intraday box for levels refreshed during the session (for example new 0DTE levels). A level with the same name as an EOD level replaces it; new names are added."
 const string TT_USED   = "A setup becomes used once price taps it and closes back out on the entry side (a confirmed rejection). Used setups lose 10 S-score points and switch to the T3-U color. Turn this off to hide them."
 const string TT_ALERT  = "Fires once per bar close when price taps a visible T3 zone and closes back out on the entry side. To receive it, create an alert on this indicator with the condition 'Any alert() function call'."
@@ -217,6 +217,7 @@ normRoot(string r) =>
         "M2K" => "RTY"
         "MGC" => "GC"
         "MCL" => "CL"
+        "SIL" => "SI"
         => r
 
 cleanTicker(string t) =>
@@ -271,8 +272,17 @@ parseInto(string raw, map<string, float> px, map<string, string> disp) =>
     string pending = ""
     array<string> toks = str.split(useTxt, ",")
     for tk in toks
-        string t = squash(str.replace_all(tk, "=", " "))
-        if str.length(t) > 0
+        string t = squash(tk)
+        if str.contains(t, "=")
+            // "GEX10=27750" / "1D Max=27372.57"
+            array<string> kv = str.split(t, "=")
+            string nmE = squash(kv.get(0))
+            float  pE  = str.tonumber(squash(kv.get(kv.size() - 1)))
+            if str.length(nmE) > 0 and not na(pE)
+                px.put(str.upper(nmE), pE)
+                disp.put(str.upper(nmE), nmE)
+            pending := ""
+        else if str.length(t) > 0
             float v = str.tonumber(t)
             if not na(v)
                 if str.length(pending) > 0
@@ -412,17 +422,21 @@ contractInfo(bool micro) =>
         "YM"  => 5.0
         "RTY" => 50.0
         "GC"  => 100.0
+        "SI"  => 5000.0
         "CL"  => 1000.0
         => na
+    // micro / full ratio (Micro Silver SIL is 1,000 oz = 1/5 of SI, the rest are 1/10)
+    float ratio = r == "SI" ? 0.2 : 0.1
     string nm = switch r
         "NQ"  => micro ? "MNQ" : "NQ"
         "ES"  => micro ? "MES" : "ES"
         "YM"  => micro ? "MYM" : "YM"
         "RTY" => micro ? "M2K" : "RTY"
         "GC"  => micro ? "MGC" : "GC"
+        "SI"  => micro ? "SIL" : "SI"
         "CL"  => micro ? "MCL" : "CL"
         => syminfo.root
-    float pv = na(full) ? syminfo.pointvalue : micro ? full / 10.0 : full
+    float pv = na(full) ? syminfo.pointvalue : micro ? full * ratio : full
     [pv, nm]
 
 posOf(string p) =>
