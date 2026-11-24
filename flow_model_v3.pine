@@ -1,0 +1,961 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ─────────────────────────────────────────────────────────────────────────────
+//  Flow Model V3 — Tier-3 reversal confluence model
+//
+//  A Tier-3 (T3) setup forms when three rejection sources stack inside one
+//  tolerance band:
+//      1. a volume-profile level  (POC / VAH / VAL / HVN of the 3D, 5D, 7D or Monthly profile)
+//      2. a current-session VWAP deviation band (±1σ / ±2σ / ±3σ)
+//      3. a manually pasted option level (GEX 1–10, HVL, Call Resistance, Put Support, 1D Max/Min, 0DTE levels)
+//
+//  S-score = round((profile pts + VWAP band pts + option pts) / 3), −10 once a setup has been used.
+//      Profile  : 3D 25 · 5D 50 · 7D 90 · Monthly 100
+//      VWAP     : 1σ 50 · 2σ 90 · 3σ 100
+//      Options  : HVL, GEX 7–10 = 25 · GEX 4–6, HVL 0DTE = 50 · GEX 2–3 = 90
+//                 GEX 1, Call Resistance, Put Support, 1D Max, 1D Min,
+//                 Call Resistance 0DTE, Put Support 0DTE, Gamma Wall 0DTE = 100
+//  Overlapping T3 setups of the same direction merge into a cluster that shows the highest score.
+//  The S-score measures relative confluence strength, not win probability.
+// ─────────────────────────────────────────────────────────────────────────────
+//@version=6
+indicator("Flow Model V3", shorttitle = "Flow Model V3", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+const string G_RISK = "Selected setup risk"
+const string G_OPT  = "Option data"
+const string G_SF   = "S-score filters"
+const string G_DISP = "Display controls"
+const string G_RD   = "Risk display"
+const string G_CB   = "Colors — T3 boxes"
+const string G_CT   = "Colors — touched portions"
+const string G_CVP  = "Colors — volume profiles"
+const string G_CVW  = "Colors — VWAP"
+const string G_COL  = "Colors — option levels"
+const string G_ADV  = "Model settings"
+
+const string TT_SETUP  = "Every T3 setup in the current session is numbered on its label (#1, #2, ...). Enter that number to load its entry, stop, position size, BE milestone and runner targets. 0 turns the risk overlay off."
+const string TT_CONTR  = "Micro = MNQ / MES / MYM / M2K / MGC / MCL point values. Mini = NQ / ES / YM / RTY / GC / CL. Works from the chart's root symbol, so NQ1! and MNQ1! both size correctly. Other symbols use the chart's own point value."
+const string TT_RUN    = "Runner targets are the next option levels, volume-profile levels, VWAP / VWAP bands and prior-day / prior-week highs and lows beyond the BE milestone, spaced at least 0.5R apart."
+const string TT_EOD    = "Paste end-of-day option levels as comma separated name, price pairs. A ticker prefix is optional, and several tickers can go on separate lines (the line that matches the chart is used). Example:\n$NQ1!: Call Resistance, 21600, Put Support, 21000, HVL, 21300, 1D Min, 21080, 1D Max, 21550, Call Resistance 0DTE, 21450, Put Support 0DTE, 21150, HVL 0DTE, 21280, Gamma Wall 0DTE, 21400, GEX 1, 21500, GEX 2, 21350, GEX 3, 21200\nNames not in the grading chart are drawn but never used as confluence."
+const string TT_INTRA  = "Use the intraday box for levels refreshed during the session (for example new 0DTE levels). A level with the same name as an EOD level replaces it; new names are added."
+const string TT_USED   = "A setup becomes used once price taps it and closes back out on the entry side (a confirmed rejection). Used setups lose 10 S-score points and switch to the T3-U color. Turn this off to hide them."
+const string TT_ALERT  = "Fires once per bar close when price taps a visible T3 zone and closes back out on the entry side. To receive it, create an alert on this indicator with the condition 'Any alert() function call'."
+
+// ── Selected setup risk
+int    iSetupNum   = input.int(0, "Setup number (0 = off)", minval = 0, tooltip = TT_SETUP, group = G_RISK, display = display.none)
+float  iRiskUsd    = input.float(200, "Risk budget (USD)", minval = 1, group = G_RISK, display = display.none)
+string iContract   = input.string("Micro", "Execution contract", options = ["Micro", "Mini"], tooltip = TT_CONTR, group = G_RISK, display = display.none)
+bool   iShowPart   = input.bool(true, "Show optional partial at BE milestone", group = G_RISK, display = display.none)
+bool   iShowRun    = input.bool(true, "Show runner targets", tooltip = TT_RUN, group = G_RISK, display = display.none)
+
+// ── Option data
+string iEodText    = input.text_area("", "EOD option levels", tooltip = TT_EOD, group = G_OPT, display = display.none)
+bool   iIntraOn    = input.bool(false, "Enable intraday levels", tooltip = TT_INTRA, group = G_OPT, display = display.none)
+string iIntraText  = input.text_area("", "Intraday option levels", tooltip = TT_INTRA, group = G_OPT, display = display.none)
+
+// ── S-score filters
+bool   iF1         = input.bool(false, "Under 50", group = G_SF, display = display.none)
+bool   iF2         = input.bool(false, "50-74", group = G_SF, display = display.none)
+bool   iF3         = input.bool(true, "75-89", group = G_SF, display = display.none)
+bool   iF4         = input.bool(true, "90-100", group = G_SF, display = display.none)
+
+// ── Display controls
+bool   iShowBoxes  = input.bool(true, "Show T3 setup boxes", group = G_DISP, display = display.none)
+bool   iShowUsed   = input.bool(true, "Show previously used setups", tooltip = TT_USED, group = G_DISP, display = display.none)
+bool   iShowVP     = input.bool(true, "Show volume profiles", group = G_DISP, display = display.none)
+bool   iShowLbl    = input.bool(true, "Show labels", group = G_DISP, display = display.none)
+bool   iShowOpt    = input.bool(true, "Show manual option levels", group = G_DISP, display = display.none)
+bool   iShowVwap   = input.bool(false, "Show current-session VWAP", group = G_DISP, display = display.none)
+bool   iShowBands  = input.bool(false, "Show current-session VWAP 1/2/3 bands", group = G_DISP, display = display.none)
+bool   iShade      = input.bool(true, "Shade touched portion", group = G_DISP, display = display.none)
+bool   iAlerts     = input.bool(true, "Enable confirmed setup alerts", tooltip = TT_ALERT, group = G_DISP, display = display.none)
+
+// ── Risk display
+int    iExt        = input.int(12, "Line extension bars", minval = 0, maxval = 400, group = G_RD, display = display.none)
+bool   iShowRisk   = input.bool(true, "Show risk box", group = G_RD, display = display.none)
+string iBoxPos     = input.string("Top right", "Box position", options = ["Top right", "Top center", "Top left", "Middle right", "Middle left", "Bottom right", "Bottom center", "Bottom left"], group = G_RD, display = display.none)
+string iBoxLay     = input.string("Vertical", "Box layout", options = ["Vertical", "Horizontal"], group = G_RD, display = display.none)
+string iBoxTxt     = input.string("Small", "Box text size", options = ["Tiny", "Small", "Normal", "Large"], group = G_RD, display = display.none)
+
+// ── Colors — T3 boxes
+color  cLongT3     = input.color(#00E676, "Long T3 color", group = G_CB)
+color  cShortT3    = input.color(#F23645, "Short T3 color", group = G_CB)
+color  cCluster    = input.color(#00BCD4, "Cluster color", group = G_CB)
+color  cEdge       = input.color(#FDD835, "Edge color", group = G_CB)
+color  cT3U        = input.color(#FF9800, "T3-U color", group = G_CB)
+color  cLongIn     = input.color(color.new(#5B7CFA, 70), "Long inner box color", group = G_CB)
+color  cShortIn    = input.color(color.new(#E8A33D, 70), "Short inner box color", group = G_CB)
+color  cLongC      = input.color(color.new(#26C6DA, 55), "Long center box color", group = G_CB)
+color  cShortC     = input.color(color.new(#FFE066, 55), "Short center box color", group = G_CB)
+
+// ── Colors — touched portions
+color  cTL         = input.color(color.new(#4A6CF7, 60), "Long touched portion", group = G_CT)
+color  cTS         = input.color(color.new(#F5A623, 55), "Short touched portion", group = G_CT)
+color  cTC         = input.color(color.new(#A64DC9, 55), "Cluster touched portion", group = G_CT)
+color  cTU         = input.color(color.new(#787B86, 55), "T3-U touched portion", group = G_CT)
+
+// ── Colors — volume profiles
+color  cVpTxt      = input.color(#FFFFFF, "Label text color", group = G_CVP)
+color  cVpLong     = input.color(#2EDCF0, "Long profile color", group = G_CVP)
+color  cVpShort    = input.color(#FF4D5A, "Short profile color", group = G_CVP)
+
+// ── Colors — VWAP
+color  cVwap       = input.color(#FFFFFF, "VWAP color", group = G_CVW)
+color  cBand       = input.color(#787B86, "VWAP band color", group = G_CVW)
+
+// ── Colors — option levels
+color  cOpt        = input.color(#B388FF, "Option level color", group = G_COL)
+color  cOpt0       = input.color(#FF80AB, "0DTE level color", group = G_COL)
+
+// ── Model settings (advanced)
+string iApply      = input.string("Current session only", "Apply option levels to", options = ["Current session only", "All loaded history"], tooltip = "Pasted option levels are valid for one trading day, so by default setups are only built for the current session. 'All loaded history' applies today's levels to every session (useful for study, not for backtesting).", group = G_ADV, display = display.none)
+float  iTolPts     = input.float(0, "Confluence tolerance (points, 0 = auto)", minval = 0, tooltip = "Maximum distance between the highest and lowest of the three levels for them to count as one T3 zone.", group = G_ADV, display = display.none)
+float  iTolAtr     = input.float(4.0, "Auto tolerance (% of daily ATR)", minval = 0.5, step = 0.5, group = G_ADV, display = display.none)
+int    iWarm       = input.int(30, "VWAP warm-up (minutes)", minval = 0, tooltip = "VWAP bands are compressed right after the session opens. No setups are formed until this much time has passed.", group = G_ADV, display = display.none)
+int    iLb3        = input.int(3, "3-day profile sessions", minval = 1, maxval = 60, group = G_ADV, display = display.none)
+int    iLb5        = input.int(5, "5-day profile sessions", minval = 1, maxval = 60, group = G_ADV, display = display.none)
+int    iLb7        = input.int(7, "7-day / weekly profile sessions", minval = 1, maxval = 60, group = G_ADV, display = display.none)
+int    iLbM        = input.int(20, "Monthly profile sessions", minval = 1, maxval = 60, group = G_ADV, display = display.none)
+float  iRowPts     = input.float(0, "Profile row size (points, 0 = auto)", minval = 0, group = G_ADV, display = display.none)
+float  iVA         = input.float(70, "Value area %", minval = 10, maxval = 100, group = G_ADV, display = display.none)
+int    iHvnN       = input.int(2, "HVNs per profile", minval = 0, maxval = 6, group = G_ADV, display = display.none)
+string iHist       = input.string("5-day", "Profile histogram", options = ["3-day", "5-day", "7-day", "Monthly", "None"], group = G_ADV, display = display.none)
+int    iHistW      = input.int(60, "Histogram width (bars)", minval = 5, maxval = 300, group = G_ADV, display = display.none)
+int    iHistRows   = input.int(48, "Histogram rows", minval = 10, maxval = 80, group = G_ADV, display = display.none)
+string iEntryRef   = input.string("Zone edge", "Entry reference", options = ["Zone edge", "Inner box", "Center box"], tooltip = "Zone edge = first touch of the T3 box. Inner box = edge of the tightest two-level core. Center box = average of the three levels.", group = G_ADV, display = display.none)
+int    iStopBuf    = input.int(4, "Stop buffer (ticks beyond edge)", minval = 0, group = G_ADV, display = display.none)
+
+const int MAX_SETUPS = 70
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═════════════════════════════════════════════════════════════════════════════
+// Volume of one session, keyed by price-row index, split into up-bar and down-bar volume.
+type DayVol
+    map<int, float> up
+    map<int, float> dn
+
+// A composite volume profile.
+type Prof
+    string       tag
+    int          score
+    float        poc
+    float        vah
+    float        val
+    array<float> hvn
+    int          minBin
+    array<float> upv
+    array<float> dnv
+
+// A price level with its S-score points.
+type Lvl
+    float  price
+    int    score
+    string name
+    bool   zeroDte = false
+
+// A volume-profile level and an option level that already sit within tolerance.
+type Pair
+    int vi
+    int oi
+
+type Setup
+    int        num
+    int        sess
+    int        dir
+    float      lo
+    float      hi
+    float      coreLo
+    float      coreHi
+    float      mid
+    int        baseScore
+    string     desc
+    array<int> keys
+    bool       active   = true
+    bool       armed    = false
+    bool       touched  = false
+    bool       used     = false
+    bool       invalid  = false
+    int        confirms = 0
+    float      deep
+    int        touchBar
+    int        leftBar
+    int        rightBar
+    box        bx
+    box        inner
+    box        center
+    box        touchBx
+    line       edge
+    label      lb
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+trimS(string s) =>
+    int n = str.length(s)
+    int a = 0
+    while a < n and str.substring(s, a, a + 1) == " "
+        a += 1
+    int b = n - 1
+    while b >= a and str.substring(s, b, b + 1) == " "
+        b -= 1
+    a > b ? "" : str.substring(s, a, b + 1)
+
+squash(string s) =>
+    string r = s
+    for i = 0 to 5
+        r := str.replace_all(r, "  ", " ")
+    trimS(r)
+
+normRoot(string r) =>
+    switch r
+        "MNQ" => "NQ"
+        "MES" => "ES"
+        "MYM" => "YM"
+        "M2K" => "RTY"
+        "MGC" => "GC"
+        "MCL" => "CL"
+        => r
+
+cleanTicker(string t) =>
+    string s = str.upper(t)
+    for ch in array.from("$", "!", "/", " ", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+        s := str.replace_all(s, ch, "")
+    s
+
+// S-score points of an option level name (0 = not part of the grading chart).
+optScore(string key) =>
+    string n = squash(str.upper(key))
+    bool   z = str.contains(n, "0DTE")
+    string b = squash(str.replace_all(n, "0DTE", ""))
+    int    s = 0
+    if z
+        s := b == "HVL" or b == "GAMMA FLIP" or b == "ZERO GAMMA" ? 50 : b == "CALL RESISTANCE" or b == "PUT SUPPORT" or b == "GAMMA WALL" or b == "CALL WALL" or b == "PUT WALL" ? 100 : 0
+    else if str.startswith(b, "GEX")
+        float k = str.tonumber(squash(str.replace_all(b, "GEX", "")))
+        if not na(k)
+            s := k == 1 ? 100 : k <= 3 ? 90 : k <= 6 ? 50 : k <= 10 ? 25 : 0
+    else if b == "HVL" or b == "GAMMA FLIP" or b == "ZERO GAMMA"
+        s := 25
+    else if b == "CALL RESISTANCE" or b == "PUT SUPPORT" or b == "1D MAX" or b == "1D MIN" or b == "CALL WALL" or b == "PUT WALL" or b == "GAMMA WALL"
+        s := 100
+    s
+
+// Parses "name, price, name, price ..." text into the two maps (upper-case name → price / display name).
+parseInto(string raw, map<string, float> px, map<string, string> disp) =>
+    string txt = str.replace_all(raw, "\r", "")
+    txt := str.replace_all(txt, "\t", " ")
+    txt := str.replace_all(txt, ";", ",")
+    string root      = normRoot(syminfo.root)
+    string matched   = ""
+    string plain     = ""
+    string prefAll   = ""
+    int    nPref     = 0
+    array<string> lines = str.split(txt, "\n")
+    for ln in lines
+        string t = squash(ln)
+        if str.length(t) > 0
+            array<string> parts = str.split(t, ":")
+            string body = parts.get(parts.size() - 1)
+            bool hasPrefix = parts.size() > 1 and str.contains(body, ",")
+            if hasPrefix
+                nPref += 1
+                prefAll += "," + body
+                if normRoot(cleanTicker(parts.get(parts.size() - 2))) == root
+                    matched += "," + body
+            else
+                plain += "," + str.replace_all(t, ":", ",")
+    string useTxt = str.length(matched) > 0 ? matched + plain : nPref == 1 ? prefAll + plain : plain
+    string pending = ""
+    array<string> toks = str.split(useTxt, ",")
+    for tk in toks
+        string t = squash(str.replace_all(tk, "=", " "))
+        if str.length(t) > 0
+            float v = str.tonumber(t)
+            if not na(v)
+                if str.length(pending) > 0
+                    string k = str.upper(pending)
+                    px.put(k, v)
+                    disp.put(k, pending)
+                    pending := ""
+            else
+                array<string> w = str.split(t, " ")
+                string lastW = w.get(w.size() - 1)
+                float lv = str.tonumber(lastW)
+                if w.size() > 1 and not na(lv) and (lv > 10 or str.contains(lastW, "."))
+                    w.pop()
+                    string nm = squash(array.join(w, " "))
+                    string k = str.upper(nm)
+                    px.put(k, lv)
+                    disp.put(k, nm)
+                    pending := ""
+                else
+                    pending := t
+    px.size()
+
+// Builds a composite profile from the last n completed sessions.
+buildProf(array<DayVol> ds, int n, string tag, int score, float bin, float vaPct, int hvnN) =>
+    Prof p = Prof.new(tag, score, na, na, na, array.new<float>(), 0, array.new<float>(), array.new<float>())
+    int sz   = ds.size()
+    int take = math.min(n, sz)
+    if take > 0
+        map<int, float> mu = map.new<int, float>()
+        map<int, float> md = map.new<int, float>()
+        int mn = na
+        int mx = na
+        for i = sz - take to sz - 1
+            DayVol d = ds.get(i)
+            array<int>   ku = d.up.keys()
+            array<float> vu = d.up.values()
+            array<int>   kd = d.dn.keys()
+            array<float> vd = d.dn.values()
+            int nu = ku.size()
+            int nd = kd.size()
+            if nu > 0
+                for j = 0 to nu - 1
+                    int k = ku.get(j)
+                    mu.put(k, nz(mu.get(k)) + vu.get(j))
+                    mn := na(mn) ? k : math.min(mn, k)
+                    mx := na(mx) ? k : math.max(mx, k)
+            if nd > 0
+                for j = 0 to nd - 1
+                    int k = kd.get(j)
+                    md.put(k, nz(md.get(k)) + vd.get(j))
+                    mn := na(mn) ? k : math.min(mn, k)
+                    mx := na(mx) ? k : math.max(mx, k)
+        if not na(mn)
+            int nb = mx - mn + 1
+            array<float> vol = array.new<float>(nb, 0.0)
+            for j = 0 to nb - 1
+                float u = nz(mu.get(mn + j))
+                float w = nz(md.get(mn + j))
+                p.upv.push(u)
+                p.dnv.push(w)
+                vol.set(j, u + w)
+            p.minBin := mn
+            float total = vol.sum()
+            if total > 0
+                // POC + value area
+                int pocI = vol.indexof(vol.max())
+                int lo = pocI
+                int hi = pocI
+                float acc = vol.get(pocI)
+                float target = total * vaPct / 100.0
+                while acc < target and (lo > 0 or hi < nb - 1)
+                    float upN = hi < nb - 1 ? vol.get(hi + 1) : -1.0
+                    float dnN = lo > 0 ? vol.get(lo - 1) : -1.0
+                    if upN >= dnN
+                        hi += 1
+                        acc += upN
+                    else
+                        lo -= 1
+                        acc += dnN
+                p.poc := math.round_to_mintick((mn + pocI + 0.5) * bin)
+                p.vah := math.round_to_mintick((mn + hi + 1) * bin)
+                p.val := math.round_to_mintick((mn + lo) * bin)
+                // HVNs: local peaks of the smoothed profile, away from the POC
+                if hvnN > 0 and nb > 4
+                    array<float> sm = array.new<float>(nb, 0.0)
+                    for j = 0 to nb - 1
+                        float a = vol.get(j)
+                        float c = 1.0
+                        if j > 0
+                            a += vol.get(j - 1)
+                            c += 1.0
+                        if j < nb - 1
+                            a += vol.get(j + 1)
+                            c += 1.0
+                        sm.set(j, a / c)
+                    float mean = total / nb
+                    int wdt = math.max(2, int(nb / 40))
+                    array<int>   pk = array.new<int>()
+                    array<float> pv = array.new<float>()
+                    for j = 0 to nb - 1
+                        float v = sm.get(j)
+                        bool isPk = v >= mean * 1.2 and math.abs(j - pocI) > wdt
+                        if isPk
+                            int a0 = math.max(0, j - wdt)
+                            int a1 = math.min(nb - 1, j + wdt)
+                            for q = a0 to a1
+                                if (q < j and sm.get(q) >= v) or (q > j and sm.get(q) > v)
+                                    isPk := false
+                                    break
+                        if isPk
+                            pk.push(j)
+                            pv.push(v)
+                    if pk.size() > 0
+                        array<int> ord = pv.sort_indices(order.descending)
+                        int cnt = math.min(hvnN, ord.size())
+                        for q = 0 to cnt - 1
+                            p.hvn.push(math.round_to_mintick((mn + pk.get(ord.get(q)) + 0.5) * bin))
+    p
+
+addProfLevels(array<Lvl> out, Prof p) =>
+    if not na(p.poc)
+        out.push(Lvl.new(p.poc, p.score, p.tag + " POC"))
+        out.push(Lvl.new(p.vah, p.score, p.tag + " VAH"))
+        out.push(Lvl.new(p.val, p.score, p.tag + " VAL"))
+        for h in p.hvn
+            out.push(Lvl.new(h, p.score, p.tag + " HVN"))
+    out.size()
+
+scoreOk(int sc) =>
+    sc < 50 ? iF1 : sc < 75 ? iF2 : sc < 90 ? iF3 : iF4
+
+contractInfo(bool micro) =>
+    string r = normRoot(syminfo.root)
+    float full = switch r
+        "NQ"  => 20.0
+        "ES"  => 50.0
+        "YM"  => 5.0
+        "RTY" => 50.0
+        "GC"  => 100.0
+        "CL"  => 1000.0
+        => na
+    string nm = switch r
+        "NQ"  => micro ? "MNQ" : "NQ"
+        "ES"  => micro ? "MES" : "ES"
+        "YM"  => micro ? "MYM" : "YM"
+        "RTY" => micro ? "M2K" : "RTY"
+        "GC"  => micro ? "MGC" : "GC"
+        "CL"  => micro ? "MCL" : "CL"
+        => syminfo.root
+    float pv = na(full) ? syminfo.pointvalue : micro ? full / 10.0 : full
+    [pv, nm]
+
+posOf(string p) =>
+    switch p
+        "Top right"     => position.top_right
+        "Top center"    => position.top_center
+        "Top left"      => position.top_left
+        "Middle right"  => position.middle_right
+        "Middle left"   => position.middle_left
+        "Bottom right"  => position.bottom_right
+        "Bottom center" => position.bottom_center
+        => position.bottom_left
+
+sizeOf(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+softColor(color c, int t) =>
+    color.t(c) == 0 ? color.new(c, t) : c
+
+// ── Setup drawing
+method draw(Setup s) =>
+    int   sc    = s.baseScore - (s.used ? 10 : 0)
+    bool  vis   = scoreOk(sc) and (not s.used or iShowUsed)
+    bool  showB = vis and iShowBoxes
+    bool  cl    = s.keys.size() > 1
+    color main  = s.used ? cT3U : cl ? cCluster : s.dir == 1 ? cLongT3 : cShortT3
+    int   rx    = s.active ? bar_index + 1 : s.rightBar
+    // outer T3 box
+    s.bx.set_lefttop(s.leftBar, s.hi)
+    s.bx.set_rightbottom(rx, s.lo)
+    s.bx.set_border_color(showB ? main : color(na))
+    s.bx.set_bgcolor(showB ? color.new(main, 88) : color(na))
+    // inner box = tightest two-level core
+    s.inner.set_lefttop(s.leftBar, s.coreHi)
+    s.inner.set_rightbottom(rx, s.coreLo)
+    s.inner.set_bgcolor(showB ? (s.dir == 1 ? cLongIn : cShortIn) : color(na))
+    // center box = average of the three levels
+    float cH = math.max(syminfo.mintick, (s.hi - s.lo) * 0.1)
+    s.center.set_lefttop(s.leftBar, s.mid + cH / 2)
+    s.center.set_rightbottom(rx, s.mid - cH / 2)
+    s.center.set_bgcolor(showB ? (s.dir == 1 ? cLongC : cShortC) : color(na))
+    // touched portion
+    bool hasT = s.touched and not na(s.deep) and not na(s.touchBar)
+    if hasT
+        s.touchBx.set_lefttop(s.touchBar, s.dir == 1 ? s.hi : s.deep)
+        s.touchBx.set_rightbottom(rx, s.dir == 1 ? s.deep : s.lo)
+    color tc = s.used ? cTU : cl ? cTC : s.dir == 1 ? cTL : cTS
+    s.touchBx.set_bgcolor(showB and iShade and hasT ? tc : color(na))
+    // invalidation edge
+    float ey = s.dir == 1 ? s.lo : s.hi
+    s.edge.set_xy1(s.leftBar, ey)
+    s.edge.set_xy2(rx, ey)
+    s.edge.set_color(showB ? cEdge : color(na))
+    // label
+    string kind = s.used ? "T3-U" : cl ? "CLUSTER" : "T3"
+    string txt  = "#" + str.tostring(s.num) + " " + kind + " " + (s.dir == 1 ? "LONG" : "SHORT") + "  S" + str.tostring(sc) + (cl ? "  (" + str.tostring(s.keys.size()) + " setups)" : "") + "\n" + s.desc
+    s.lb.set_xy(rx, s.mid)
+    s.lb.set_text(vis and iShowLbl ? txt : "")
+    s.lb.set_textcolor(main)
+    sc
+
+method kill(Setup s) =>
+    s.bx.delete()
+    s.inner.delete()
+    s.center.delete()
+    s.touchBx.delete()
+    s.edge.delete()
+    s.lb.delete()
+    true
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MARKET DATA
+// ═════════════════════════════════════════════════════════════════════════════
+bool newDay = timeframe.change("D")
+
+[dAtr, pdh, pdl] = request.security(syminfo.tickerid, "D", [ta.atr(14)[1], high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl]       = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+[vw, vU1, vL1] = ta.vwap(hlc3, newDay, 1)
+[vw2, vU2, vL2] = ta.vwap(hlc3, newDay, 2)
+[vw3, vU3, vL3] = ta.vwap(hlc3, newDay, 3)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═════════════════════════════════════════════════════════════════════════════
+var float          binSz    = na
+var DayVol         cur      = DayVol.new(map.new<int, float>(), map.new<int, float>())
+var array<DayVol>  days     = array.new<DayVol>()
+var array<Prof>    profs    = array.new<Prof>()
+var array<Lvl>     vpLv     = array.new<Lvl>()
+var array<Lvl>     opLv     = array.new<Lvl>()
+var array<Pair>    pairs    = array.new<Pair>()
+var array<Setup>   setups   = array.new<Setup>()
+var map<int, bool> formed   = map.new<int, bool>()
+var int            sessId   = 0
+var int            sessBar  = 0
+var int            sessT    = 0
+var int            setupCtr = 0
+var bool           isLive   = false
+var float          tolDay   = na
+
+bool applyAll = iApply == "All loaded history"
+int  maxKeep  = math.max(iLb3, iLb5, iLb7, iLbM)
+
+// One-time: row size + option level parsing
+if barstate.isfirst
+    binSz := iRowPts > 0 ? iRowPts : math.max(syminfo.mintick, math.round(close * 0.0001 / syminfo.mintick) * syminfo.mintick)
+    map<string, float>  pxm = map.new<string, float>()
+    map<string, string> dm  = map.new<string, string>()
+    parseInto(iEodText, pxm, dm)
+    if iIntraOn
+        parseInto(iIntraText, pxm, dm)
+    array<string> ks = pxm.keys()
+    for k in ks
+        opLv.push(Lvl.new(pxm.get(k), optScore(k), dm.get(k), str.contains(k, "0DTE")))
+    sessBar := bar_index
+    sessT   := time
+    isLive  := last_bar_time < time + 86400000
+
+// ── New trading day: archive volume, expire setups, rebuild profiles and level pairs
+if newDay and not barstate.isfirst
+    if cur.up.size() + cur.dn.size() > 0
+        days.push(cur)
+    while days.size() > maxKeep
+        days.shift()
+    cur      := DayVol.new(map.new<int, float>(), map.new<int, float>())
+    sessId   += 1
+    sessBar  := bar_index
+    sessT    := time
+    setupCtr := 0
+    formed.clear()
+    isLive   := last_bar_time < time + 86400000
+    for s in setups
+        if s.active
+            s.active   := false
+            s.rightBar := bar_index - 1
+            s.draw()
+    profs.clear()
+    vpLv.clear()
+    pairs.clear()
+    bool applyDay = applyAll or isLive
+    if (applyDay and opLv.size() > 0) or (isLive and iShowVP)
+        tolDay := iTolPts > 0 ? iTolPts : math.max(4 * syminfo.mintick, math.round_to_mintick(nz(dAtr, close * 0.01) * iTolAtr / 100.0))
+        profs.push(buildProf(days, iLb3, "3D", 25, binSz, iVA, iHvnN))
+        profs.push(buildProf(days, iLb5, "5D", 50, binSz, iVA, iHvnN))
+        profs.push(buildProf(days, iLb7, "7D", 90, binSz, iVA, iHvnN))
+        profs.push(buildProf(days, iLbM, "1M", 100, binSz, iVA, iHvnN))
+        for p in profs
+            addProfLevels(vpLv, p)
+        int nv = vpLv.size()
+        int no = opLv.size()
+        if applyDay and nv > 0 and no > 0
+            for i = 0 to nv - 1
+                for j = 0 to no - 1
+                    Lvl o = opLv.get(j)
+                    if o.score > 0 and math.abs(vpLv.get(i).price - o.price) <= tolDay
+                        pairs.push(Pair.new(i, j))
+
+// ── Accumulate this bar's volume into the running session profile
+float vol0 = nz(volume)
+if vol0 > 0 and not na(binSz)
+    int  b0     = math.floor(low / binSz)
+    int  b1     = math.floor(high / binSz)
+    float per   = vol0 / (b1 - b0 + 1)
+    bool upBar  = close >= open
+    for b = b0 to b1
+        if upBar
+            cur.up.put(b, nz(cur.up.get(b)) + per)
+        else
+            cur.dn.put(b, nz(cur.dn.get(b)) + per)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SETUP ENGINE (bar close only — no repainting)
+// ═════════════════════════════════════════════════════════════════════════════
+bool confLong  = false
+bool confShort = false
+
+if barstate.isconfirmed
+    // 1) Manage live setups: touch → confirmation (rejection close) or invalidation (close beyond edge)
+    for s in setups
+        if s.active
+            bool tapped = s.dir == 1 ? low <= s.hi : high >= s.lo
+            if tapped
+                if not s.touched
+                    s.touchBar := bar_index
+                s.touched := true
+                s.armed   := true
+                float d = s.dir == 1 ? math.max(low, s.lo) : math.min(high, s.hi)
+                s.deep := na(s.deep) ? d : s.dir == 1 ? math.min(s.deep, d) : math.max(s.deep, d)
+            bool broke  = s.dir == 1 ? close < s.lo : close > s.hi
+            bool reject = s.dir == 1 ? close > s.hi : close < s.lo
+            if broke
+                s.active   := false
+                s.invalid  := true
+                s.armed    := false
+                s.rightBar := bar_index
+            else if s.armed and reject
+                int  scBefore  = s.baseScore - (s.used ? 10 : 0)
+                bool visBefore = scoreOk(scBefore) and (not s.used or iShowUsed)
+                bool wasUsed   = s.used
+                s.armed    := false
+                s.used     := true
+                s.confirms += 1
+                if s.dir == 1
+                    confLong := true
+                else
+                    confShort := true
+                if iAlerts and visBefore
+                    string kind = wasUsed ? "T3-U" : s.keys.size() > 1 ? "CLUSTER" : "T3"
+                    alert("Flow Model V3 | " + syminfo.ticker + " | #" + str.tostring(s.num) + " " + kind + " " + (s.dir == 1 ? "LONG" : "SHORT") + " confirmed | S" + str.tostring(scBefore) + " | zone " + fmt(s.lo) + " - " + fmt(s.hi) + " | " + s.desc, alert.freq_once_per_bar_close)
+            s.draw()
+
+    // 2) Form new T3 setups: a (profile, option) pair that a VWAP band has moved onto
+    if (applyAll or isLive) and pairs.size() > 0 and time - sessT >= iWarm * 60000
+        array<float>  lb = array.from(vL1, vL2, vL3)
+        array<float>  ub = array.from(vU1, vU2, vU3)
+        array<int>    bs = array.from(50, 90, 100)
+        array<string> bn = array.from("1σ", "2σ", "3σ")
+        for pr in pairs
+            int key = pr.vi * 1000 + pr.oi
+            if not formed.contains(key)
+                Lvl v = vpLv.get(pr.vi)
+                Lvl o = opLv.get(pr.oi)
+                int dir = 0
+                int bi  = -1
+                // check the strongest band first
+                for jj = 0 to 2
+                    int j = 2 - jj
+                    if dir == 0
+                        float bl = lb.get(j)
+                        if not na(bl)
+                            float lA = math.min(v.price, o.price, bl)
+                            float hA = math.max(v.price, o.price, bl)
+                            if hA - lA <= tolDay and close > hA
+                                dir := 1
+                                bi  := j
+                    if dir == 0
+                        float bu = ub.get(j)
+                        if not na(bu)
+                            float lB = math.min(v.price, o.price, bu)
+                            float hB = math.max(v.price, o.price, bu)
+                            if hB - lB <= tolDay and close < lB
+                                dir := -1
+                                bi  := j
+                if dir != 0
+                    formed.put(key, true)
+                    float b    = dir == 1 ? lb.get(bi) : ub.get(bi)
+                    int   sc   = math.round((v.score + bs.get(bi) + o.score) / 3.0)
+                    float lo3  = math.min(v.price, o.price, b)
+                    float hi3  = math.max(v.price, o.price, b)
+                    float minH = math.max(2 * syminfo.mintick, tolDay * 0.25)
+                    if hi3 - lo3 < minH
+                        float m = (hi3 + lo3) / 2
+                        lo3 := m - minH / 2
+                        hi3 := m + minH / 2
+                    lo3 := math.round_to_mintick(lo3)
+                    hi3 := math.round_to_mintick(hi3)
+                    // tightest two-level core
+                    float dVO = math.abs(v.price - o.price)
+                    float dVB = math.abs(v.price - b)
+                    float dOB = math.abs(o.price - b)
+                    float cA  = dVO <= dVB and dVO <= dOB ? v.price : dVB <= dOB ? v.price : o.price
+                    float cB  = dVO <= dVB and dVO <= dOB ? o.price : b
+                    float cLo = math.min(cA, cB)
+                    float cHi = math.max(cA, cB)
+                    float minC = minH * 0.5
+                    if cHi - cLo < minC
+                        float cm = (cHi + cLo) / 2
+                        cLo := math.max(lo3, cm - minC / 2)
+                        cHi := math.min(hi3, cm + minC / 2)
+                    float mid = (v.price + o.price + b) / 3
+                    string desc = v.name + " · VWAP " + (dir == 1 ? "-" : "+") + bn.get(bi) + " · " + o.name
+                    // merge into an overlapping live setup of the same direction → cluster
+                    Setup tgt = na
+                    for s in setups
+                        if na(tgt) and s.active and s.sess == sessId and s.dir == dir and s.lo <= hi3 and s.hi >= lo3
+                            tgt := s
+                    if not na(tgt)
+                        tgt.keys.push(key)
+                        tgt.lo := math.min(tgt.lo, lo3)
+                        tgt.hi := math.max(tgt.hi, hi3)
+                        if sc > tgt.baseScore
+                            tgt.baseScore := sc
+                            tgt.desc      := desc
+                            tgt.coreLo    := cLo
+                            tgt.coreHi    := cHi
+                            tgt.mid       := mid
+                        tgt.draw()
+                    else
+                        setupCtr += 1
+                        Setup ns = Setup.new(num = setupCtr, sess = sessId, dir = dir, lo = lo3, hi = hi3, coreLo = cLo, coreHi = cHi, mid = mid, baseScore = sc, desc = desc, keys = array.from(key), leftBar = bar_index, rightBar = bar_index)
+                        ns.bx      := box.new(bar_index, hi3, bar_index + 1, lo3, border_color = color(na), bgcolor = color(na), border_width = 1)
+                        ns.inner   := box.new(bar_index, cHi, bar_index + 1, cLo, border_color = color(na), bgcolor = color(na), border_width = 0)
+                        ns.center  := box.new(bar_index, mid, bar_index + 1, mid, border_color = color(na), bgcolor = color(na), border_width = 0)
+                        ns.touchBx := box.new(bar_index, hi3, bar_index + 1, hi3, border_color = color(na), bgcolor = color(na), border_width = 0)
+                        ns.edge    := line.new(bar_index, lo3, bar_index + 1, lo3, color = color(na), width = 2)
+                        ns.lb      := label.new(bar_index, mid, "", style = label.style_label_left, color = color(na), textcolor = color(na), size = size.small, textalign = text.align_left)
+                        setups.push(ns)
+                        ns.draw()
+                        while setups.size() > MAX_SETUPS
+                            setups.shift().kill()
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LAST-BAR OVERLAYS: option levels, volume profiles, selected setup risk
+// ═════════════════════════════════════════════════════════════════════════════
+var array<line>  ovLines  = array.new<line>()
+var array<label> ovLabels = array.new<label>()
+var array<box>   ovBoxes  = array.new<box>()
+var int   tCols = iBoxLay == "Horizontal" ? 16 : 2
+var int   tRows = iBoxLay == "Horizontal" ? 2 : 16
+var table rTbl  = table.new(posOf(iBoxPos), tCols, tRows, bgcolor = color.new(#0E1117, 12), frame_color = color.new(#787B86, 50), frame_width = 1, border_color = color.new(#787B86, 80), border_width = 1)
+
+string tSize = sizeOf(iBoxTxt)
+
+tCell(int i, string k, string v, color vc) =>
+    if iBoxLay == "Vertical"
+        rTbl.cell(0, i, k, text_color = color.new(#B2B5BE, 0), text_size = tSize, text_halign = text.align_left)
+        rTbl.cell(1, i, v, text_color = vc, text_size = tSize, text_halign = text.align_right)
+    else
+        rTbl.cell(i, 0, k, text_color = color.new(#B2B5BE, 0), text_size = tSize, text_halign = text.align_center)
+        rTbl.cell(i, 1, v, text_color = vc, text_size = tSize, text_halign = text.align_center)
+    true
+
+riskLine(int x1, int x2, float y, color c, string st, string txt) =>
+    ovLines.push(line.new(x1, y, x2, y, color = c, style = st, width = 1))
+    ovLabels.push(label.new(x2, y, txt, style = label.style_label_right, color = color(na), textcolor = c, size = size.small))
+    true
+
+if barstate.islast
+    for l in ovLines
+        l.delete()
+    for l in ovLabels
+        l.delete()
+    for b in ovBoxes
+        b.delete()
+    ovLines.clear()
+    ovLabels.clear()
+    ovBoxes.clear()
+    rTbl.clear(0, 0, tCols - 1, tRows - 1)
+
+    bool levelsLive = applyAll or isLive
+
+    // ── manual option levels
+    if iShowOpt and levelsLive
+        for o in opLv
+            color oc = o.zeroDte ? cOpt0 : cOpt
+            ovLines.push(line.new(sessBar, o.price, bar_index + iExt + 4, o.price, color = softColor(oc, 35), style = line.style_dashed, width = 1))
+            if iShowLbl
+                ovLabels.push(label.new(bar_index + iExt + 4, o.price, o.name + "  " + fmt(o.price), style = label.style_label_left, color = color(na), textcolor = oc, size = size.tiny))
+
+    // ── volume profiles: key levels + histogram of the chosen profile
+    if iShowVP and isLive and profs.size() > 0
+        for lv in vpLv
+            ovLines.push(line.new(sessBar, lv.price, bar_index + iExt, lv.price, color = color.new(cVpTxt, 70), style = line.style_dotted, width = 1))
+            if iShowLbl
+                ovLabels.push(label.new(sessBar, lv.price, lv.name, style = label.style_label_right, color = color(na), textcolor = color.new(cVpTxt, 25), size = size.tiny))
+        string hTag = switch iHist
+            "3-day"   => "3D"
+            "5-day"   => "5D"
+            "7-day"   => "7D"
+            "Monthly" => "1M"
+            => ""
+        Prof hp = na
+        for p in profs
+            if p.tag == hTag
+                hp := p
+        if not na(hp)
+            int nb = hp.upv.size()
+            if nb > 0
+                int per = math.max(1, math.ceil(nb / float(iHistRows)))
+                int nr  = math.ceil(nb / float(per))
+                array<float> ru = array.new<float>(nr, 0.0)
+                array<float> rd = array.new<float>(nr, 0.0)
+                for j = 0 to nb - 1
+                    int r = int(j / per)
+                    ru.set(r, ru.get(r) + hp.upv.get(j))
+                    rd.set(r, rd.get(r) + hp.dnv.get(j))
+                float mxv = 0.0
+                for r = 0 to nr - 1
+                    mxv := math.max(mxv, ru.get(r) + rd.get(r))
+                if mxv > 0
+                    color cu = softColor(cVpLong, 65)
+                    color cd = softColor(cVpShort, 65)
+                    for r = 0 to nr - 1
+                        int   wU = math.round(iHistW * ru.get(r) / mxv)
+                        int   wD = math.round(iHistW * rd.get(r) / mxv)
+                        float y0 = (hp.minBin + r * per) * binSz
+                        float y1 = (hp.minBin + math.min((r + 1) * per, nb)) * binSz
+                        if wU > 0
+                            ovBoxes.push(box.new(sessBar, y1, sessBar + wU, y0, border_color = color(na), bgcolor = cu))
+                        if wD > 0
+                            ovBoxes.push(box.new(sessBar + wU, y1, sessBar + wU + wD, y0, border_color = color(na), bgcolor = cd))
+
+    // ── selected setup: entry / stop / size / BE milestone / runners
+    if iShowBoxes and opLv.size() == 0
+        tCell(0, "Flow Model V3", "Paste EOD option levels in settings", color.new(#FDD835, 0))
+    else if iSetupNum > 0
+        Setup sel = na
+        for s in setups
+            if s.sess == sessId and s.num == iSetupNum
+                sel := s
+        if na(sel)
+            if iShowRisk
+                tCell(0, "Setup #" + str.tostring(iSetupNum), "not found in current session", color.new(#FDD835, 0))
+        else
+            int   d     = sel.dir
+            color main  = d == 1 ? cLongT3 : cShortT3
+            float entry = math.round_to_mintick(iEntryRef == "Zone edge" ? (d == 1 ? sel.hi : sel.lo) : iEntryRef == "Inner box" ? (d == 1 ? sel.coreHi : sel.coreLo) : sel.mid)
+            float stop  = math.round_to_mintick(d == 1 ? sel.lo - iStopBuf * syminfo.mintick : sel.hi + iStopBuf * syminfo.mintick)
+            float riskP = math.abs(entry - stop)
+            [pv, cName] = contractInfo(iContract == "Micro")
+            int   qty   = riskP > 0 and pv > 0 ? math.floor(iRiskUsd / (riskP * pv)) : 0
+            float rUsd  = qty * riskP * pv
+
+            // BE milestone: nearest VWAP / band or opposing option level at least 0.5R away
+            array<float>  bP = array.from(vw, vU1, vU2, vU3, vL1, vL2, vL3)
+            array<string> bN = array.from("VWAP", "VWAP +1σ", "VWAP +2σ", "VWAP +3σ", "VWAP -1σ", "VWAP -2σ", "VWAP -3σ")
+            for o in opLv
+                bP.push(o.price)
+                bN.push(o.name)
+            float beP = na
+            string beN = ""
+            for i = 0 to bP.size() - 1
+                float p = bP.get(i)
+                if not na(p) and riskP > 0
+                    float dist = (p - entry) * d
+                    if dist >= 0.5 * riskP and (na(beP) or dist < (beP - entry) * d)
+                        beP := p
+                        beN := bN.get(i)
+
+            // runner targets
+            array<float>  tP = bP.copy()
+            array<string> tN = bN.copy()
+            for lv in vpLv
+                tP.push(lv.price)
+                tN.push(lv.name)
+            tP.push(pdh)
+            tN.push("PDH")
+            tP.push(pdl)
+            tN.push("PDL")
+            tP.push(pwh)
+            tN.push("PWH")
+            tP.push(pwl)
+            tN.push("PWL")
+            array<float>  rP = array.new<float>()
+            array<string> rN = array.new<string>()
+            if iShowRun and riskP > 0
+                float base = na(beP) ? entry : beP
+                array<float> dd = array.new<float>()
+                array<int>   di = array.new<int>()
+                for i = 0 to tP.size() - 1
+                    float p = tP.get(i)
+                    if not na(p)
+                        float x = (p - entry) * d
+                        if x >= (base - entry) * d + 0.5 * riskP
+                            dd.push(x)
+                            di.push(i)
+                if dd.size() > 0
+                    array<int> ord = dd.sort_indices(order.ascending)
+                    float lastX = na
+                    for k = 0 to ord.size() - 1
+                        if rP.size() < 3
+                            float x = dd.get(ord.get(k))
+                            if na(lastX) or x - lastX >= 0.5 * riskP
+                                int ix = di.get(ord.get(k))
+                                rP.push(tP.get(ix))
+                                rN.push(tN.get(ix))
+                                lastX := x
+
+            // chart lines
+            int x1 = math.max(sel.leftBar, bar_index - 300)
+            int x2 = bar_index + iExt
+            riskLine(x1, x2, entry, main, line.style_solid, "Entry " + fmt(entry))
+            riskLine(x1, x2, stop, color.new(#F23645, 0), line.style_solid, "Stop " + fmt(stop) + "  -1R")
+            if not na(beP)
+                string rb = str.tostring((beP - entry) * d / riskP, "#.0") + "R"
+                riskLine(x1, x2, beP, cEdge, line.style_dashed, (iShowPart ? "BE + partial " : "BE ") + fmt(beP) + "  +" + rb + "  (" + beN + ")")
+            if rP.size() > 0
+                for k = 0 to rP.size() - 1
+                    float p = rP.get(k)
+                    riskLine(x1, x2, p, color.new(main, 20), line.style_dotted, "Runner " + str.tostring(k + 1) + " " + fmt(p) + "  +" + str.tostring((p - entry) * d / riskP, "#.0") + "R  (" + rN.get(k) + ")")
+
+            // risk box
+            if iShowRisk
+                int    sc     = sel.baseScore - (sel.used ? 10 : 0)
+                string kind   = sel.used ? "T3-U" : sel.keys.size() > 1 ? "CLUSTER" : "T3"
+                string status = sel.invalid ? "Invalidated" : not sel.active ? "Expired" : sel.armed ? "In zone - wait for rejection" : sel.used ? "Used (confirmed x" + str.tostring(sel.confirms) + ")" : sel.touched ? "Touched" : "Waiting for tap"
+                int r = 0
+                tCell(r, "Setup", "#" + str.tostring(sel.num) + " " + kind + " " + (d == 1 ? "LONG" : "SHORT"), main)
+                r += 1
+                tCell(r, "S-score", str.tostring(sc) + (sel.used ? "  (used -10)" : ""), color.white)
+                r += 1
+                tCell(r, "Status", status, color.white)
+                r += 1
+                tCell(r, "Zone", fmt(sel.lo) + " - " + fmt(sel.hi), color.white)
+                r += 1
+                tCell(r, "Entry", fmt(entry) + "  (" + iEntryRef + ")", main)
+                r += 1
+                tCell(r, "Stop", fmt(stop), color.new(#F23645, 0))
+                r += 1
+                tCell(r, "Risk", str.tostring(riskP, "#.##") + " pts", color.white)
+                r += 1
+                tCell(r, "Size", qty > 0 ? str.tostring(qty) + " x " + cName : "0 - stop too wide for budget", qty > 0 ? color.white : color.new(#FDD835, 0))
+                r += 1
+                tCell(r, "$ at risk", "$" + str.tostring(rUsd, "#,###.##") + " / $" + str.tostring(iRiskUsd, "#,###"), color.white)
+                r += 1
+                if not na(beP)
+                    tCell(r, iShowPart ? "BE + partial" : "BE milestone", fmt(beP) + "  +" + str.tostring((beP - entry) * d / riskP, "#.0") + "R", cEdge)
+                    r += 1
+                if rP.size() > 0
+                    for k = 0 to rP.size() - 1
+                        float p = rP.get(k)
+                        tCell(r, "Runner " + str.tostring(k + 1), fmt(p) + "  +" + str.tostring((p - entry) * d / riskP, "#.0") + "R  " + rN.get(k), main)
+                        r += 1
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PLOTS + ALERT CONDITIONS
+// ═════════════════════════════════════════════════════════════════════════════
+bool vwapOn = isLive
+plot(iShowVwap and vwapOn ? vw : na, "VWAP", cVwap, 2, plot.style_linebr)
+plot(iShowBands and vwapOn ? vU1 : na, "VWAP +1σ", color.new(cBand, 40), 1, plot.style_linebr)
+plot(iShowBands and vwapOn ? vL1 : na, "VWAP -1σ", color.new(cBand, 40), 1, plot.style_linebr)
+plot(iShowBands and vwapOn ? vU2 : na, "VWAP +2σ", color.new(cBand, 20), 1, plot.style_linebr)
+plot(iShowBands and vwapOn ? vL2 : na, "VWAP -2σ", color.new(cBand, 20), 1, plot.style_linebr)
+plot(iShowBands and vwapOn ? vU3 : na, "VWAP +3σ", cBand, 2, plot.style_linebr)
+plot(iShowBands and vwapOn ? vL3 : na, "VWAP -3σ", cBand, 2, plot.style_linebr)
+
+alertcondition(confLong, "Confirmed long T3", "Flow Model V3: confirmed LONG T3 setup on {{ticker}} at {{close}}")
+alertcondition(confShort, "Confirmed short T3", "Flow Model V3: confirmed SHORT T3 setup on {{ticker}} at {{close}}")
